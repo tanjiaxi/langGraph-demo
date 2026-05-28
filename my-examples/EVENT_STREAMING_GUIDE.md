@@ -1,734 +1,364 @@
-# LangGraph Event Streaming 深度指南
+# LangGraph Event Streaming 完整指南
 
-## 📚 目录
+本指南严格按照官方文档编写: https://docs.langchain.com/oss/python/langgraph/event-streaming
 
-1. [核心概念](#核心概念)
-2. [架构原理](#架构原理)
-3. [API 对比](#api-对比)
-4. [投影类型](#投影类型)
-5. [应用场景](#应用场景)
-6. [最佳实践](#最佳实践)
-7. [常见问题](#常见问题)
+## 概述
 
----
+Event Streaming 是 LangGraph v1.2+ 推荐的流式 API,提供类型化的投影（projections）来消费图执行过程中的事件。
 
 ## 核心概念
 
-### 什么是 Event Streaming？
+### 1. 基本 API
 
-**Event Streaming** 是 LangGraph v1.2+ 引入的推荐流式 API，它提供了**类型化的投影（Typed Projections）**来消费图执行事件。
-
-### 为什么需要 Event Streaming？
-
-**传统 stream_mode API 的问题：**
 ```python
-# 旧方式：需要手动解析 stream_mode 元组
-for chunk in graph.stream(input, stream_mode="values"):
-    # 需要判断 chunk 的类型和结构
-    if isinstance(chunk, tuple):
-        node, data = chunk
-        # 处理数据...
+# 同步版本
+stream = graph.stream_events(input_data, version="v3")
+
+# 异步版本
+stream = await graph.astream_events(input_data, version="v3")
 ```
 
-**Event Streaming 的优势：**
+### 2. 类型化投影
+
+| 投影 | 用途 | 访问方式 |
+|------|------|----------|
+| `stream.values` | 状态快照流 | `for snapshot in stream.values` |
+| `stream.output` | 最终输出 | 同步: `stream.output` / 异步: `await stream.output()` |
+| `stream.messages` | 消息流 | `for message in stream.messages` |
+| `stream.subgraphs` | 子图执行 | `for subgraph in stream.subgraphs` |
+| `stream.interrupts` | 中断信息 | `stream.interrupts` |
+| `stream.interrupted` | 是否中断 | `stream.interrupted` |
+| `stream` | 原始协议事件 | `for event in stream` |
+| `stream.extensions` | 自定义投影 | `stream.extensions["name"]` |
+
+### 3. 同步 vs 异步
+
+**同步 (stream_events)**:
+- `stream.output` 是属性
+- 使用 `stream.interleave()` 交错消费多个投影
+
+**异步 (astream_events)**:
+- `stream.output()` 是方法,需要 `await`
+- 使用 `asyncio.gather()` 并发消费多个投影
+
+## 示例场景
+
+### 场景 1: 基础流式输出
+
 ```python
-# 新方式：类型化投影，清晰明确
-stream = graph.stream_events(input, version="v3")
+stream = graph.stream_events(input_data, version="v3")
 
-# 直接访问消息流
-for message in stream.messages:
-    print(message.text)
-
-# 直接访问状态流
+# 消费状态快照
 for snapshot in stream.values:
-    print(snapshot)
-```
-
-### 核心优势
-
-1. **类型安全**：每个投影都有明确的类型
-2. **并发消费**：可以同时消费多个投影
-3. **独立迭代**：读取 `stream.messages` 不会消耗 `stream.values` 的事件
-4. **可扩展**：支持自定义流转换器
-
----
-
-## 架构原理
-
-### 整体架构
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     LangGraph Pregel Engine                  │
-│  (执行图节点，生成原始执行事件)                              │
-└────────────────────┬────────────────────────────────────────┘
-                     │ Raw Pregel Events
-                     │ (updates, values, messages, custom, ...)
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      Event Router                            │
-│  (规范化事件，路由到转换器管道)                              │
-└────────────────────┬────────────────────────────────────────┘
-                     │ Protocol Events
-                     │ (ProtocolEvent 包装)
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  Stream Transformers                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │   Values     │  │   Messages   │  │   Custom     │      │
-│  │ Transformer  │  │ Transformer  │  │ Transformer  │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└────────────────────┬────────────────────────────────────────┘
-                     │ Projected Events
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Event Stream Object                       │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  stream.messages   → 消息投影                        │   │
-│  │  stream.values     → 状态快照投影                    │   │
-│  │  stream.subgraphs  → 子图投影                        │   │
-│  │  stream.output     → 最终输出                        │   │
-│  │  stream.extensions → 自定义投影                      │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                     │
-                     ▼
-              Application Code
-              (你的业务逻辑)
-```
-
-### 事件流转过程
-
-1. **Pregel Engine** 执行图节点，生成原始事件
-2. **Event Router** 规范化事件为 `ProtocolEvent` 格式
-3. **Stream Transformers** 处理事件，生成投影
-4. **Event Stream** 暴露类型化投影给应用代码
-
-### ProtocolEvent 结构
-
-```python
-class ProtocolEvent(TypedDict):
-    seq: int                    # 严格递增的序列号（用于排序）
-    method: str                 # 通道名称: "messages", "values", "custom", ...
-    params: ProtocolEventParams
-
-class ProtocolEventParams(TypedDict):
-    namespace: list[str]        # 从根图到当前作用域的路径
-    timestamp: int              # 墙钟时间（毫秒）
-    data: Any                   # 通道特定的负载
-```
-
-**示例事件：**
-```python
-{
-    "seq": 42,
-    "method": "values",
-    "params": {
-        "namespace": ["researcher:6f4d"],
-        "timestamp": 1704067200000,
-        "data": {"messages": [...], "counter": 5}
-    }
-}
-```
-
----
-
-## API 对比
-
-### stream_mode API (旧方式)
-
-```python
-# 需要指定 stream_mode
-for chunk in graph.stream(input, stream_mode="values"):
-    print(chunk)  # 元组或字典，需要手动解析
-
-# 多个 stream_mode 需要多次调用
-for chunk in graph.stream(input, stream_mode="messages"):
-    print(chunk)
-```
-
-**缺点：**
-- 需要手动解析不同 stream_mode 的输出格式
-- 无法同时消费多个 stream_mode
-- 类型不安全
-
-### stream_events API (新方式)
-
-```python
-# 一次调用，多个投影
-stream = graph.stream_events(input, version="v3")
-
-# 类型化访问
-for message in stream.messages:
-    print(message.text)
-
-for snapshot in stream.values:
-    print(snapshot)
-
-# 并发消费
-async def consume_all():
-    await asyncio.gather(
-        consume_messages(stream),
-        consume_values(stream)
-    )
-```
-
-**优点：**
-- 类型安全
-- 并发消费
-- 清晰的 API
-
----
-
-## 投影类型
-
-### 1. stream.messages - 消息流
-
-**用途：** 流式输出 LLM 生成的消息
-
-```python
-stream = graph.stream_events(input, version="v3")
-
-for message in stream.messages:
-    # Token 级别的流式输出
-    for token in message.text:
-        print(token, end="", flush=True)
-    
-    # 访问推理过程
-    for reasoning in message.reasoning:
-        print(f"[思考] {reasoning}")
-    
-    # 访问工具调用
-    for tool_call in message.tool_calls:
-        print(f"[工具] {tool_call.name}({tool_call.args})")
-    
-    # 访问使用统计
-    if message.output.usage_metadata:
-        print(f"Token 使用: {message.output.usage_metadata}")
-```
-
-**关键属性：**
-- `message.text` - 可迭代的文本流
-- `message.reasoning` - 推理过程流
-- `message.tool_calls` - 工具调用流
-- `message.node` - 生成消息的节点名称
-- `message.output` - 完整的消息对象
-
-### 2. stream.values - 状态快照流
-
-**用途：** 监控每个步骤后的完整状态
-
-```python
-stream = graph.stream_events(input, version="v3")
-
-for snapshot in stream.values:
-    print(f"当前状态: {snapshot}")
-    print(f"消息数: {len(snapshot.get('messages', []))}")
-    print(f"计数器: {snapshot.get('counter')}")
-```
-
-**特点：**
-- 每个节点执行后生成一个快照
-- 包含完整的图状态
-- 适合监控状态变化
-
-### 3. stream.subgraphs - 子图流
-
-**用途：** 监控嵌套图的执行
-
-```python
-stream = graph.stream_events(input, version="v3")
-
-for subgraph in stream.subgraphs:
-    print(f"子图: {subgraph.graph_name}")
-    print(f"路径: {subgraph.path}")
-    
-    # 访问子图的消息
-    for message in subgraph.messages:
-        print(f"  [子图消息] {message.text}")
-```
-
-**关键属性：**
-- `subgraph.graph_name` - 子图名称
-- `subgraph.path` - 从根图到子图的路径
-- `subgraph.messages` - 子图的消息流
-- `subgraph.values` - 子图的状态流
-
-### 4. stream.output - 最终输出
-
-**用途：** 等待并获取最终结果
-
-```python
-stream = graph.stream_events(input, version="v3")
-
-# 消费流
-for message in stream.messages:
-    print(message.text)
+    print(f"Counter: {snapshot['counter']}")
 
 # 获取最终输出
 final_state = stream.output
-print(f"最终结果: {final_state}")
 ```
 
-**特点：**
-- 阻塞直到图执行完成
-- 返回最终状态
-- 类似于 `graph.invoke()` 的返回值
-
-### 5. stream.interrupts - 中断信息
-
-**用途：** 检查人机协作中断
+### 场景 2: 异步并发消费
 
 ```python
-stream = graph.stream_events(input, version="v3")
+stream = await graph.astream_events(input_data, version="v3")
 
-# 消费流
-for message in stream.messages:
-    print(message.text)
+async def consume_values():
+    async for snapshot in stream.values:
+        print(f"State: {snapshot}")
+
+async def consume_events():
+    async for event in stream:
+        print(f"Event: {event['method']}")
+
+# 并发消费
+await asyncio.gather(consume_values(), consume_events())
+
+# 获取最终输出 (异步需要 await)
+final_state = await stream.output()
+```
+
+### 场景 3: 交错消费 (同步)
+
+```python
+stream = graph.stream_events(input_data, version="v3")
+
+# 按严格到达顺序消费多个投影
+for name, item in stream.interleave("values", "messages"):
+    if name == "values":
+        print(f"State: {item}")
+    elif name == "messages":
+        print(f"Message: {item}")
+```
+
+### 场景 4: 人机协作中断和恢复
+
+```python
+from langgraph.types import Command
+
+# 第一次运行 - 直到中断点
+stream = graph.stream_events(input_data, config=config, version="v3")
+
+for snapshot in stream.values:
+    print(snapshot)
 
 # 检查是否中断
 if stream.interrupted:
-    print("执行已暂停")
-    print(f"中断信息: {stream.interrupts}")
+    print(f"Interrupted: {stream.interrupts}")
     
-    # 恢复执行
+    # 使用 Command 恢复执行
     resume_stream = graph.stream_events(
-        Command(resume={"approval": "approve"}),
+        Command(resume={"user_decision": "approve"}),
         config=config,
         version="v3"
     )
+    
+    final_output = resume_stream.output
 ```
 
-### 6. stream.extensions - 自定义投影
+**注意**: 
+- 需要使用 `checkpointer` 和 `config` 中的 `thread_id`
+- `interrupt_before` 会在节点执行前暂停
+- 可以使用 `graph.update_state()` 来更新状态后继续执行
 
-**用途：** 访问自定义流转换器的投影
+### 场景 3: 交错消费 (同步)
+
+`stream.interleave()` 是同步代码中按严格到达顺序消费多个投影的最佳方式。
 
 ```python
-# 注册自定义转换器
-graph = graph.compile(stream_transformers=[ProgressTransformer()])
+stream = graph.stream_events(input_data, version="v3")
 
-stream = graph.stream_events(input, version="v3")
-
-# 访问自定义投影
-for progress in stream.extensions.progress:
-    print(f"进度: {progress['percent']}%")
+# 交错消费多个投影 - 按严格到达顺序
+for name, item in stream.interleave("values", "messages", "subgraphs"):
+    if name == "values":
+        print(f"[state] keys={list(item)}")
+    elif name == "messages":
+        print(f"[llm] node={item.node}")
+    elif name == "subgraphs":
+        print(f"[subgraph] path={item.path}")
 ```
 
----
+**核心价值**:
+- ✅ 按严格时间顺序交错多个投影
+- ✅ 保持事件的因果关系和时序
+- ✅ 适用于日志记录、调试、实时监控
 
-## 应用场景
+**使用场景**:
+1. **聊天应用**: 交错消费 `messages` (LLM输出) 和 `values` (状态)
+2. **多智能体**: 交错消费 `subgraphs` (子图) 和 `messages`
+3. **调试工具**: 交错所有投影以查看完整执行流程
+4. **实时监控**: 按时序显示所有类型的事件
 
-### 场景 1: 实时聊天界面
+**对比**:
+- **同步代码**: 使用 `stream.interleave()` - 简单直接
+- **异步代码**: 使用 `asyncio.gather()` - 并发消费
+
+### 场景 5: 原始协议事件
 
 ```python
-async def chat_ui_handler(user_message: str):
-    """实时更新聊天界面"""
-    stream = await agent.astream_events(
-        {"messages": [{"role": "user", "content": user_message}]},
-        version="v3"
-    )
+stream = graph.stream_events(input_data, version="v3")
+
+# 迭代原始协议事件
+for event in stream:
+    namespace = event["params"]["namespace"]
+    method = event["method"]
+    seq = event["seq"]
+    data = event["params"]["data"]
     
-    # Token 级别的流式输出
-    async for message in stream.messages:
-        async for token in message.text:
-            # 实时更新 UI
-            await websocket.send({"type": "token", "data": token})
-    
-    # 发送完成信号
-    await websocket.send({"type": "complete"})
+    print(f"Event #{seq}: [{method}] {namespace}")
 ```
 
-### 场景 2: 进度条和状态监控
-
+**协议事件结构**:
 ```python
-async def monitor_progress(task_id: str):
-    """监控任务进度"""
-    stream = await graph.astream_events(input_data, version="v3")
-    
-    async def update_progress():
-        async for snapshot in stream.values:
-            progress = calculate_progress(snapshot)
-            await update_ui_progress_bar(task_id, progress)
-    
-    async def log_messages():
-        async for message in stream.messages:
-            await log_to_database(task_id, message.text)
-    
-    # 并发监控
-    await asyncio.gather(update_progress(), log_messages())
+class ProtocolEvent(TypedDict):
+    seq: int                    # 严格递增的序列号
+    method: str                 # 通道名: "messages", "values", "custom", etc.
+    params: ProtocolEventParams
+
+class ProtocolEventParams(TypedDict):
+    namespace: list[str]        # 命名空间路径
+    timestamp: int              # 时间戳 (毫秒)
+    data: Any                   # 通道特定的数据
 ```
 
-### 场景 3: 多智能体协作监控
+### 场景 6: 自定义 StreamTransformer
 
 ```python
-async def monitor_multi_agent_system():
-    """监控多智能体系统"""
-    stream = await graph.astream_events(input_data, version="v3")
-    
-    # 监控子图（子智能体）
-    async for subgraph in stream.subgraphs:
-        print(f"智能体 {subgraph.graph_name} 开始工作")
-        
-        # 监控子智能体的消息
-        async for message in subgraph.messages:
-            print(f"  [{subgraph.graph_name}] {message.text}")
-```
+from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
+from langgraph.config import get_stream_writer
 
-### 场景 4: 工具调用追踪
-
-```python
-async def trace_tool_calls():
-    """追踪工具调用"""
-    stream = await agent.astream_events(input_data, version="v3")
-    
-    async for message in stream.messages:
-        # 追踪工具调用
-        for tool_call in message.tool_calls:
-            print(f"调用工具: {tool_call.name}")
-            print(f"参数: {tool_call.args}")
-            
-            # 记录到追踪系统
-            await tracing_system.log_tool_call(
-                tool_name=tool_call.name,
-                args=tool_call.args,
-                timestamp=datetime.now()
-            )
-```
-
-### 场景 5: 人机协作工作流
-
-```python
-async def human_in_loop_workflow():
-    """人机协作工作流"""
-    config = {"configurable": {"thread_id": "session-123"}}
-    
-    # 第一阶段：运行直到中断
-    stream = await graph.astream_events(input_data, config=config, version="v3")
-    
-    async for message in stream.messages:
-        await display_to_user(message.text)
-    
-    # 检查中断
-    if stream.interrupted:
-        # 请求人工输入
-        user_decision = await request_user_input(stream.interrupts)
-        
-        # 恢复执行
-        resume_stream = await graph.astream_events(
-            Command(resume=user_decision),
-            config=config,
-            version="v3"
-        )
-        
-        async for message in resume_stream.messages:
-            await display_to_user(message.text)
-```
-
-### 场景 6: 自定义进度事件
-
-```python
+# 1. 定义转换器
 class ProgressTransformer(StreamTransformer):
-    """自定义进度转换器"""
-    required_stream_modes = ("values", "custom")
+    required_stream_modes = ("custom",)  # 声明需要的流模式
     
     def __init__(self, scope: tuple[str, ...] = ()) -> None:
         super().__init__(scope)
+        # 创建命名通道
         self.progress = StreamChannel[dict]("progress")
     
     def init(self) -> dict:
         return {"progress": self.progress}
     
     def process(self, event: ProtocolEvent) -> bool:
-        if event["method"] == "values":
-            # 计算进度
-            progress_data = {
-                "percent": calculate_percent(event),
-                "message": extract_message(event)
-            }
-            self.progress.push(progress_data)
+        if event["method"] == "custom":
+            data = event["params"]["data"]
+            if data.get("type") == "progress":
+                self.progress.push(data)
         return True
 
-# 使用
-graph = graph.compile(stream_transformers=[ProgressTransformer()])
-stream = graph.stream_events(input_data, version="v3")
+# 2. 在节点中发送自定义事件
+def my_node(state):
+    writer = get_stream_writer()
+    writer({"type": "progress", "percent": 50, "message": "进行中"})
+    return state
 
-for progress in stream.extensions.progress:
-    print(f"进度: {progress['percent']}% - {progress['message']}")
+# 3. 注册转换器并消费
+stream = graph.stream_events(
+    input_data,
+    version="v3",
+    transformers=[ProgressTransformer]  # 传递类,不是实例
+)
+
+# 从 extensions 访问自定义投影
+for progress in stream.extensions["progress"]:
+    print(f"{progress['percent']}% - {progress['message']}")
 ```
 
----
+**关键点**:
+- `required_stream_modes`: 声明需要的流模式
+- `StreamChannel`: 创建投影通道
+- `get_stream_writer()`: 在节点中发送自定义事件
+- `transformers` 参数: 传递类或工厂函数,不是实例
+- `stream.extensions`: 访问自定义投影
+
+## 通道类型
+
+| 通道 | 用途 |
+|------|------|
+| `values` | 完整的图状态快照 |
+| `updates` | 每个节点的状态增量 |
+| `messages` | 聊天模型消息输出 |
+| `tools` | 工具调用事件 |
+| `lifecycle` | 运行、子图、子代理状态 |
+| `checkpoints` | 检查点信息 |
+| `input` | 人机交互输入请求和响应 |
+| `tasks` | Pregel 任务创建和结果 |
+| `custom` | 用户自定义事件 |
+| `custom:<name>` | 应用定义的转换器输出 |
 
 ## 最佳实践
 
-### 1. 选择合适的投影
+### 1. 选择合适的 API
 
-| 需求 | 使用投影 |
-|------|---------|
-| 实时显示 LLM 输出 | `stream.messages` |
-| 监控状态变化 | `stream.values` |
-| 追踪子图执行 | `stream.subgraphs` |
-| 等待最终结果 | `stream.output` |
-| 人机协作 | `stream.interrupts` + `stream.interrupted` |
-| 自定义事件 | `stream.extensions` |
+- **新应用**: 使用 Event Streaming (`stream_events(version="v3")`)
+- **需要底层访问**: 使用 Streaming (`stream(stream_mode=...)`)
 
-### 2. 并发消费模式
+### 2. 同步 vs 异步
 
-**异步代码（推荐）：**
-```python
-stream = await graph.astream_events(input, version="v3")
+- **同步**: 简单场景,单线程消费
+- **异步**: 需要并发消费多个投影,或与其他异步代码集成
 
-async def consume_messages():
-    async for message in stream.messages:
-        await process_message(message)
+### 3. 自定义转换器
 
-async def consume_values():
-    async for snapshot in stream.values:
-        await process_snapshot(snapshot)
+- **命名通道** (`StreamChannel("name")`): 事件会出现在主事件流中
+- **匿名通道** (`StreamChannel()`): 仅作为侧通道投影
 
-# 并发消费
-await asyncio.gather(consume_messages(), consume_values())
-```
-
-**同步代码：**
-```python
-stream = graph.stream_events(input, version="v3")
-
-# 使用 interleave 按到达顺序消费
-for name, item in stream.interleave("messages", "values"):
-    if name == "messages":
-        process_message(item)
-    elif name == "values":
-        process_snapshot(item)
-```
-
-### 3. 错误处理
+### 4. 错误处理
 
 ```python
+stream = graph.stream_events(input_data, version="v3")
+
 try:
-    stream = await graph.astream_events(input, version="v3")
-    
-    async for message in stream.messages:
-        print(message.text)
-    
+    for snapshot in stream.values:
+        process(snapshot)
     final_output = stream.output
 except Exception as e:
-    print(f"执行失败: {e}")
-    # 处理错误
+    print(f"Error: {e}")
 ```
-
-### 4. 性能优化
-
-**只消费需要的投影：**
-```python
-# ❌ 不好：创建了不使用的投影
-stream = graph.stream_events(input, version="v3")
-for message in stream.messages:
-    print(message.text)
-# stream.values, stream.subgraphs 等投影被创建但未使用
-
-# ✅ 好：只消费需要的投影
-stream = graph.stream_events(input, version="v3")
-for message in stream.messages:
-    print(message.text)
-# 其他投影不会被迭代，不会产生额外开销
-```
-
-**使用自定义转换器过滤事件：**
-```python
-class FilteredTransformer(StreamTransformer):
-    """只处理特定节点的事件"""
-    required_stream_modes = ("values",)
-    
-    def process(self, event: ProtocolEvent) -> bool:
-        namespace = event["params"]["namespace"]
-        node_name = namespace[-1].split(":")[0] if namespace else ""
-        
-        # 只处理特定节点
-        if node_name not in ["important_node1", "important_node2"]:
-            return False  # 抑制事件
-        
-        return True
-```
-
-### 5. 调试技巧
-
-**查看原始事件：**
-```python
-stream = graph.stream_events(input, version="v3")
-
-# 迭代原始协议事件
-for event in stream:
-    print(f"事件 #{event['seq']}: {event['method']}")
-    print(f"  命名空间: {event['params']['namespace']}")
-    print(f"  数据: {event['params']['data']}")
-```
-
-**使用 LangSmith 追踪：**
-```python
-import os
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_API_KEY"] = "your-api-key"
-
-# 所有事件会自动发送到 LangSmith
-stream = graph.stream_events(input, version="v3")
-```
-
----
 
 ## 常见问题
 
-### Q1: stream_events 和 stream 有什么区别？
+### Q1: `stream.output` 报错 "not subscriptable"
 
-**A:** 
-- `stream()` 是旧的 stream_mode API，返回元组或字典，需要手动解析
-- `stream_events()` 是新的 Event Streaming API，返回类型化投影，更易用
+**原因**: 异步版本中 `stream.output()` 是方法,需要 `await`
 
-**推荐使用 `stream_events(version="v3")`**
-
-### Q2: 为什么需要 version="v3"？
-
-**A:** 
-- `v3` 是最新的事件流协议版本
-- 提供了更好的类型安全和性能
-- 未来版本可能会有 breaking changes，显式指定版本确保兼容性
-
-### Q3: 如何在同步代码中使用？
-
-**A:**
+**解决**:
 ```python
-# 同步版本
-stream = graph.stream_events(input, version="v3")
+# 同步
+final_state = stream.output
 
-# 异步版本
-stream = await graph.astream_events(input, version="v3")
+# 异步
+final_state = await stream.output()
 ```
 
-### Q4: 消费一个投影会影响其他投影吗？
+### Q2: 自定义事件没有被捕获
 
-**A:** 不会。每个投影是独立的，消费 `stream.messages` 不会影响 `stream.values`。
+**原因**: 
+1. 没有声明 `required_stream_modes = ("custom",)`
+2. 没有注册转换器
 
-### Q5: 如何实现超时控制？
-
-**A:**
-```python
-import asyncio
-
-async def with_timeout():
-    stream = await graph.astream_events(input, version="v3")
-    
-    try:
-        async with asyncio.timeout(30):  # 30秒超时
-            async for message in stream.messages:
-                print(message.text)
-    except asyncio.TimeoutError:
-        print("执行超时")
-```
-
-### Q6: 自定义转换器的 required_stream_modes 是什么？
-
-**A:** 
-- 声明转换器需要哪些 Pregel stream modes
-- 运行时会合并所有转换器的 required_stream_modes
-- 只有声明的 modes 才会被 Pregel 引擎发出
-
+**解决**:
 ```python
 class MyTransformer(StreamTransformer):
-    # 声明需要 custom 和 values 模式
-    required_stream_modes = ("custom", "values")
-    
-    def process(self, event: ProtocolEvent) -> bool:
-        # 只会收到 custom 和 values 事件
-        if event["method"] == "custom":
-            # 处理自定义事件
-            pass
-        return True
+    required_stream_modes = ("custom",)  # 必须声明
+    # ...
+
+stream = graph.stream_events(
+    input_data,
+    version="v3",
+    transformers=[MyTransformer]  # 必须注册
+)
 ```
 
-### Q7: 如何处理大量事件？
+### Q3: 中断没有触发
 
-**A:**
+**原因**: `interrupt_before` 会在节点执行前暂停,需要正确的配置
+
+**解决**:
 ```python
-# 使用自定义转换器过滤
-class SamplingTransformer(StreamTransformer):
-    """采样转换器 - 只保留 10% 的事件"""
-    def __init__(self):
-        super().__init__()
-        self.counter = 0
-    
-    def process(self, event: ProtocolEvent) -> bool:
-        self.counter += 1
-        # 只保留每10个事件中的1个
-        return self.counter % 10 == 0
+# 1. 编译时配置
+graph = builder.compile(
+    checkpointer=InMemorySaver(),
+    interrupt_before=["node_name"]
+)
 
-graph = graph.compile(stream_transformers=[SamplingTransformer()])
+# 2. 使用 config 和 thread_id
+config = {"configurable": {"thread_id": "unique-id"}}
+
+# 3. 检查状态
+state = graph.get_state(config)
+if state.next:
+    # 有待执行的节点
+    graph.update_state(config, {"key": "value"})
 ```
 
-### Q8: 如何在 FastAPI 中使用？
+### Q4: transformers 参数报错
 
-**A:**
+**错误**: `transformers must be scope-aware callables`
+
+**原因**: 传递了实例而不是类
+
+**解决**:
 ```python
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+# ❌ 错误
+transformers=[MyTransformer()]
 
-app = FastAPI()
+# ✅ 正确
+transformers=[MyTransformer]
 
-@app.post("/chat/stream")
-async def chat_stream(message: str):
-    async def event_generator():
-        stream = await agent.astream_events(
-            {"messages": [{"role": "user", "content": message}]},
-            version="v3"
-        )
-        
-        async for msg in stream.messages:
-            async for token in msg.text:
-                yield f"data: {token}\n\n"
-    
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream"
-    )
+# ✅ 或使用工厂函数
+transformers=[lambda scope: MyTransformer(scope, custom_arg="value")]
 ```
 
----
+## 应用场景
 
-## 总结
+1. **实时 UI 更新**: 聊天界面、进度条
+2. **多智能体协作监控**: 观察子图执行
+3. **工具调用追踪**: 监控工具执行
+4. **自定义进度事件**: 通过 StreamTransformer
+5. **人机协作工作流**: 中断和恢复
+6. **调试和可观测性**: 原始协议事件
 
-### 核心要点
+## 参考资源
 
-1. **Event Streaming 是推荐的流式 API** - 使用 `stream_events(version="v3")`
-2. **类型化投影** - messages, values, subgraphs, output, extensions
-3. **并发消费** - 使用 `asyncio.gather()` 或 `stream.interleave()`
-4. **可扩展** - 通过 `StreamTransformer` 添加自定义投影
-5. **人机协作** - 使用 `stream.interrupted` 和 `Command(resume=...)`
-
-### 架构理解
-
-```
-Pregel Engine → Event Router → Stream Transformers → Typed Projections → Application
-```
-
-### 何时使用
-
-| 场景 | 使用 |
-|------|------|
-| 实时 UI 更新 | `stream.messages` |
-| 状态监控 | `stream.values` |
-| 子图追踪 | `stream.subgraphs` |
-| 人机协作 | `stream.interrupts` |
-| 自定义事件 | `StreamTransformer` + `stream.extensions` |
-| 调试 | 迭代原始 `stream` 对象 |
-
-### 下一步
-
-1. 运行 `event_streaming_comprehensive.py` 查看所有示例
-2. 阅读官方文档：https://docs.langchain.com/oss/python/langgraph/event-streaming
-3. 在你的项目中实践 Event Streaming
-4. 尝试创建自定义 StreamTransformer
-
----
-
-**参考资源：**
-- [LangGraph Event Streaming 文档](https://docs.langchain.com/oss/python/langgraph/event-streaming)
-- [LangGraph Streaming 文档](https://docs.langchain.com/oss/python/langgraph/streaming)
-- [LangChain Event Streaming 文档](https://docs.langchain.com/oss/python/langchain/event-streaming)
+- [官方文档](https://docs.langchain.com/oss/python/langgraph/event-streaming)
+- [示例代码](./examples9_event_streaming.py)
+- [LangGraph GitHub](https://github.com/langchain-ai/langgraph)
