@@ -422,3 +422,230 @@ print("="*60)
 
 # 关闭数据库连接
 conn.close()
+
+
+# ============================================
+# 第九部分：PostgreSQL 持久化存储
+# ============================================
+
+print("\n" + "="*60)
+print("🐘 第九部分：PostgreSQL 持久化存储")
+print("="*60)
+
+print("""
+PostgreSQL vs SQLite:
+--------------------
+SQLite:
+  - 单文件数据库
+  - 适合单机应用
+  - 并发能力有限
+  - 简单易用
+
+PostgreSQL:
+  - 客户端-服务器架构
+  - 适合生产环境
+  - 高并发支持
+  - 支持分布式部署
+  - 更强大的查询能力
+""")
+
+try:
+    from langgraph.checkpoint.postgres import PostgresSaver
+    import psycopg  # PostgreSQL 驱动
+    
+    print("\n📦 PostgreSQL 依赖已安装")
+    print("   如果未安装,请运行: pip install langgraph-checkpoint-postgres psycopg")
+    
+    # PostgreSQL 连接配置
+    PG_URI = "postgresql://postgres:postgres@10.10.10.10:5432/langgraph_checkpoints?sslmode=disable"
+    
+    print(f"\n🔌 连接到 PostgreSQL:")
+    print(f"   主机: 10.10.10.10")
+    print(f"   端口: 5432")
+    print(f"   用户: postgres")
+    print(f"   数据库: langgraph_checkpoints")
+    
+    # 创建 PostgreSQL 连接
+    print("\n⏳ 正在连接...")
+    
+    try:
+        # 方式1: 使用连接字符串
+        pg_conn = psycopg.connect(PG_URI, autocommit=True, prepare_threshold=0)
+        
+        # 创建 PostgresSaver
+        postgres_memory = PostgresSaver(pg_conn)
+        
+        # 设置数据库表 (首次使用需要)
+        postgres_memory.setup()
+        
+        print("✅ PostgreSQL 连接成功!")
+        
+        # 使用 PostgreSQL 编译图
+        app_with_postgres = graph.compile(checkpointer=postgres_memory)
+        
+        print("\n🧪 测试 7：PostgreSQL 持久化")
+        
+        # 测试保存对话
+        pg_config = {"configurable": {"thread_id": "postgres_user_001"}}
+        
+        print("\n--- 第 1 轮对话 ---")
+        result = app_with_postgres.invoke(
+            {"messages": [HumanMessage(content="你好，我在测试 PostgreSQL 存储")]},
+            config=pg_config
+        )
+        print(f"🤖 AI: {result['messages'][-1].content[:60]}...")
+        
+        print("\n--- 第 2 轮对话 ---")
+        result = app_with_postgres.invoke(
+            {"messages": [HumanMessage(content="我刚才说在测试什么？")]},
+            config=pg_config
+        )
+        print(f"🤖 AI: {result['messages'][-1].content[:60]}...")
+        print("   ✅ PostgreSQL 成功保存和恢复对话历史!")
+        
+        # 多用户测试
+        print("\n🧪 测试 8：PostgreSQL 多用户会话")
+        
+        # 用户 A
+        user_a_config = {"configurable": {"thread_id": "pg_user_alice"}}
+        result = app_with_postgres.invoke(
+            {"messages": [HumanMessage(content="我是 Alice，我在上海")]},
+            config=user_a_config
+        )
+        print(f"👤 Alice: {result['messages'][-1].content[:50]}...")
+        
+        # 用户 B
+        user_b_config = {"configurable": {"thread_id": "pg_user_bob"}}
+        result = app_with_postgres.invoke(
+            {"messages": [HumanMessage(content="我是 Bob，我在北京")]},
+            config=user_b_config
+        )
+        print(f"👤 Bob: {result['messages'][-1].content[:50]}...")
+        
+        # 继续用户 A 的会话
+        result = app_with_postgres.invoke(
+            {"messages": [HumanMessage(content="我在哪个城市？")]},
+            config=user_a_config
+        )
+        print(f"👤 Alice 继续: {result['messages'][-1].content[:50]}...")
+        print("   ✅ PostgreSQL 正确隔离了不同用户的会话!")
+        
+        # 查看 PostgreSQL 中的数据
+        print("\n📊 查看 PostgreSQL 中的检查点数据:")
+        
+        cursor = pg_conn.cursor()
+        cursor.execute("""
+            SELECT thread_id, checkpoint_ns, checkpoint_id 
+            FROM checkpoints 
+            ORDER BY checkpoint_id DESC 
+            LIMIT 5
+        """)
+        
+        rows = cursor.fetchall()
+        print(f"\n   最近的 {len(rows)} 个检查点:")
+        for row in rows:
+            thread_id, ns, checkpoint_id = row
+            print(f"   • Thread: {thread_id}, Namespace: {ns}, ID: {checkpoint_id}")
+        
+        cursor.close()
+        
+        # 清理测试数据 (可选)
+        print("\n🧹 清理选项:")
+        print("   如果需要清理测试数据,可以运行:")
+        print("   DELETE FROM checkpoints WHERE thread_id LIKE 'pg_user_%';")
+        
+        # 关闭连接
+        pg_conn.close()
+        print("\n✅ PostgreSQL 连接已关闭")
+        
+    except psycopg.OperationalError as e:
+        print(f"\n❌ PostgreSQL 连接失败: {e}")
+        print("\n💡 请检查:")
+        print("   1. PostgreSQL 服务是否运行")
+        print("   2. 主机地址和端口是否正确 (10.10.10.10:5432)")
+        print("   3. 用户名和密码是否正确 (postgres/postgres)")
+        print("   4. 数据库是否存在 (langgraph_checkpoints)")
+        print("   5. 防火墙是否允许连接")
+        print("\n📝 创建数据库的 SQL:")
+        print("   CREATE DATABASE langgraph_checkpoints;")
+        
+    except Exception as e:
+        print(f"\n❌ 发生错误: {e}")
+        print(f"   错误类型: {type(e).__name__}")
+
+except ImportError as e:
+    print("\n⚠️  PostgreSQL 依赖未安装")
+    print("\n📦 安装方法:")
+    print("   pip install langgraph-checkpoint-postgres")
+    print("   pip install psycopg[binary]")
+    print("\n   或者:")
+    print("   pip install 'psycopg[binary,pool]'")
+
+
+# ============================================
+# 第十部分：存储后端对比总结
+# ============================================
+
+print("\n" + "="*60)
+print("📊 存储后端对比总结")
+print("="*60)
+
+print("""
+┌─────────────────┬──────────────┬──────────────┬──────────────┐
+│     特性        │  MemorySaver │  SqliteSaver │ PostgresSaver│
+├─────────────────┼──────────────┼──────────────┼──────────────┤
+│ 持久化          │      ❌      │      ✅      │      ✅      │
+│ 并发支持        │      低      │      中      │      高      │
+│ 分布式部署      │      ❌      │      ❌      │      ✅      │
+│ 设置难度        │      易      │      易      │      中      │
+│ 性能            │      高      │      中      │      高      │
+│ 适用场景        │  开发/测试   │  单机应用    │  生产环境    │
+│ 数据备份        │      ❌      │   文件复制   │   数据库备份 │
+│ 查询能力        │      弱      │      中      │      强      │
+└─────────────────┴──────────────┴──────────────┴──────────────┘
+
+使用建议:
+--------
+1. 开发阶段: MemorySaver (快速迭代)
+2. 小型应用: SqliteSaver (简单可靠)
+3. 生产环境: PostgresSaver (高性能、高可用)
+4. 高并发: PostgresSaver + 连接池
+
+代码示例:
+--------
+# MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
+memory = MemorySaver()
+
+# SqliteSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+conn = sqlite3.connect("chat.db", check_same_thread=False)
+memory = SqliteSaver(conn)
+
+# PostgresSaver
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
+conn = psycopg.connect("postgresql://user:pass@host:5432/db")
+memory = PostgresSaver(conn)
+memory.setup()  # 首次使用需要创建表
+
+# 使用
+app = graph.compile(checkpointer=memory)
+""")
+
+print("\n" + "="*60)
+print("✅ 所有 Memory 示例完成!")
+print("="*60)
+print("\n📚 学到的内容:")
+print("   1. MemorySaver - 内存存储 (测试)")
+print("   2. SqliteSaver - SQLite 存储 (单机)")
+print("   3. PostgresSaver - PostgreSQL 存储 (生产)")
+print("   4. 多用户会话管理")
+print("   5. 历史记录查看")
+print("   6. 实际应用场景")
+print("\n💡 下一步:")
+print("   • 查看 examples7_advanced_memory.py 了解高级用法")
+print("   • 查看 MEMORY_DEEP_DIVE.md 了解更多细节")
+print("="*60)
+

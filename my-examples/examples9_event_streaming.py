@@ -25,15 +25,27 @@ LangGraph Event Streaming 综合示例
 """
 
 import asyncio
+import os
 from typing import TypedDict, Annotated
 import operator
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from langgraph.stream import ProtocolEvent, StreamChannel, StreamTransformer
 from langgraph.config import get_stream_writer
+from langchain_openai import ChatOpenAI
 
+# 初始化 LLM (使用 DeepSeek)
+llm = ChatOpenAI(
+    model="deepseek-chat",
+    openai_api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    openai_api_base="https://api.deepseek.com",
+    temperature=0.7,
+    streaming=True  # 启用流式输出
+)
+
+os.environ["DEEPSEEK_API_KEY"] = "sk-1f1f27b8e0524422bab4b8517b1068ca"
 
 # ============================================================================
 # 场景 1: 基础流式输出 - 使用 stream.values
@@ -447,30 +459,44 @@ def demo_human_in_loop():
         "stage": "初始化"
     }
     
-    config = {"configurable": {"thread_id": "demo-thread-1"}}
+    config = {"configurable": {"thread_id": "demo-thread-4"}}
     
     # 第一次运行 - 直到中断点
     print("\n🚀 第一阶段: 运行直到中断点")
+    print("说明: interrupt_before=['request_decision'] 会在该节点执行前暂停")
+    print()
+    
     stream = graph.stream_events(input_data, config=config, version="v3")
     
+    # 消费状态快照
     for snapshot in stream.values:
         print(f"  [状态] stage={snapshot.get('stage')}")
     
-    # 检查是否中断
-    if stream.interrupted:
-        print("\n⏸️  执行已暂停")
-        print(f"  中断信息: {stream.interrupts}")
+    # 重要: 在消费完流后,检查图的状态而不是 stream.interrupted
+    # 因为 stream_events 的 interrupted 属性可能不可靠
+    state_snapshot = graph.get_state(config)
+    
+    print(f"\n📊 检查图状态:")
+    print(f"  当前阶段: {state_snapshot.values.get('stage')}")
+    print(f"  下一个节点: {state_snapshot.next}")
+    print(f"  是否有待执行节点: {bool(state_snapshot.next)}")
+    
+    # 检查是否有待执行的节点 (表示中断)
+    if state_snapshot.next:
+        print("\n⏸️  执行已在中断点暂停!")
+        print(f"  等待执行的节点: {state_snapshot.next}")
+        print(f"  这就是 interrupt_before 的效果")
         
         # 模拟人工决策
         print("\n👤 人工决策: approve")
+        print("  方式1: 使用 update_state 更新状态")
         
-        # 使用 Command 恢复执行
+        # 更新状态以提供决策
+        graph.update_state(config, {"user_decision": "approve"})
+        
+        # 继续执行
         print("\n▶️  第二阶段: 恢复执行")
-        resume_stream = graph.stream_events(
-            Command(resume={"user_decision": "approve"}),
-            config=config,
-            version="v3"
-        )
+        resume_stream = graph.stream_events(None, config=config, version="v3")
         
         for snapshot in resume_stream.values:
             print(f"  [状态] stage={snapshot.get('stage')}")
@@ -479,32 +505,52 @@ def demo_human_in_loop():
         final_output = resume_stream.output
         print(f"  阶段: {final_output['stage']}")
         print(f"  决策: {final_output['user_decision']}")
+        
+        # 展示另一种恢复方式
+        print("\n" + "="*80)
+        print("💡 另一种恢复方式: 使用 Command(resume=...)")
+        print("="*80)
+        
+        # 重新运行演示
+        config2 = {"configurable": {"thread_id": "demo-thread-4-alt"}}
+        
+        # 第一次运行
+        stream_alt = graph.stream_events(input_data, config=config2, version="v3")
+        for _ in stream_alt.values:
+            pass  # 消费到中断点
+        
+        # 使用 Command 恢复
+        print("使用 Command(resume={...}) 恢复执行:")
+        resume_stream_alt = graph.stream_events(
+            Command(resume={"user_decision": "reject"}),
+            config=config2,
+            version="v3"
+        )
+        
+        for snapshot in resume_stream_alt.values:
+            stage = snapshot.get('stage', '')
+            if '执行完成' in stage:
+                print(f"  [状态] {stage}")
+        
+        final_alt = resume_stream_alt.output
+        print(f"  决策结果: {final_alt['user_decision']}")
     else:
-        print("\n⚠️  未检测到中断")
-        print("  说明: interrupt_before 会在节点执行前暂停")
-        print("  由于这是演示,我们直接使用 update_state 来模拟人工输入")
-        
-        # 获取当前状态
-        state = graph.get_state(config)
-        print(f"  当前状态: {state.values.get('stage')}")
-        print(f"  下一个节点: {state.next}")
-        
-        if state.next:
-            # 更新状态以提供决策
-            graph.update_state(config, {"user_decision": "approve"})
-            print("\n👤 人工决策: approve (通过 update_state)")
-            
-            # 继续执行
-            print("\n▶️  继续执行:")
-            resume_stream = graph.stream_events(None, config=config, version="v3")
-            
-            for snapshot in resume_stream.values:
-                print(f"  [状态] stage={snapshot.get('stage')}")
-            
-            print("\n✅ 最终输出:")
-            final_output = resume_stream.output
-            print(f"  阶段: {final_output['stage']}")
-            print(f"  决策: {final_output['user_decision']}")
+        print("\n⚠️  未检测到中断点")
+        print("  这不应该发生,请检查图配置")
+    
+    # 解释说明
+    print("\n" + "="*80)
+    print("📚 关键知识点:")
+    print("="*80)
+    print("1. interrupt_before=['node'] 在节点执行前暂停")
+    print("2. 使用 graph.get_state(config) 检查是否中断")
+    print("3. state.next 不为空表示有待执行的节点 (中断)")
+    print("4. 恢复方式:")
+    print("   • update_state() + stream_events(None, config)")
+    print("   • stream_events(Command(resume={...}), config)")
+    print("5. 必须使用 checkpointer 和 thread_id")
+    print("6. stream.interrupted 在 stream_events 中可能不可靠")
+    print("   推荐使用 graph.get_state(config).next 来判断")
 
 
 # ============================================================================
@@ -633,30 +679,165 @@ def demo_custom_transformer():
     print("场景 6: 自定义 StreamTransformer - 进度追踪")
     print("="*80)
     
-    graph = create_progress_graph()
+    # ========================================================================
+    # 💡 什么是 StreamTransformer?
+    # ========================================================================
+    print("\n💡 什么是 StreamTransformer?")
+    print("="*60)
+    print("""
+StreamTransformer 是一个强大的机制,用于:
+1. 观察和转换原始协议事件
+2. 创建自定义的投影 (projections)
+3. 将底层事件转换为应用层需要的格式
+
+工作流程:
+  图执行 → 原始事件 → StreamTransformer → 自定义投影 → 应用代码
+  
+  例如:
+  节点发送 custom 事件 → ProgressTransformer 处理 → progress 投影 → UI 显示进度条
+    """)
     
+    # ========================================================================
+    # 📖 ProgressTransformer 的作用
+    # ========================================================================
+    print("\n📖 ProgressTransformer 的作用:")
+    print("="*60)
+    print("""
+1. 监听 'custom' 通道的事件
+2. 过滤出 type='progress' 的事件
+3. 将这些事件推送到 'progress' 投影
+4. 应用代码通过 stream.extensions['progress'] 访问
+
+代码结构:
+  class ProgressTransformer(StreamTransformer):
+      required_stream_modes = ("custom",)  # 声明需要监听 custom 通道
+      
+      def __init__(self, scope):
+          self.progress = StreamChannel("progress")  # 创建投影通道
+      
+      def init(self):
+          return {"progress": self.progress}  # 注册投影
+      
+      def process(self, event):
+          if event["method"] == "custom":  # 监听 custom 事件
+              if event["data"].get("type") == "progress":
+                  self.progress.push(event["data"])  # 推送到投影
+          return True
+    """)
+    
+    # ========================================================================
+    # 🎯 实际演示
+    # ========================================================================
+    print("\n🎯 实际演示:")
+    print("="*60)
+    
+    graph = create_progress_graph()
     input_data = {"data": "", "step": 0}
     
-    # 注册自定义转换器 - 传递类而不是实例
+    print("\n方式1: 不使用 StreamTransformer (手动处理)")
+    print("-" * 60)
+    
+    # 不使用转换器,手动处理原始事件
+    stream_raw = graph.stream_events(input_data, version="v3")
+    
+    progress_events_manual = []
+    for event in stream_raw:
+        if event["method"] == "custom":
+            data = event["params"]["data"]
+            if isinstance(data, dict) and data.get("type") == "progress":
+                progress_events_manual.append(data)
+                print(f"  [手动] {data['step']} - {data['percent']}% - {data['message']}")
+    
+    print(f"\n  手动捕获: {len(progress_events_manual)} 个进度事件")
+    print("  ⚠️  问题: 需要手动过滤和处理,代码重复")
+    
+    print("\n方式2: 使用 StreamTransformer (自动处理)")
+    print("-" * 60)
+    
+    # 使用转换器,自动处理
     stream = graph.stream_events(
         input_data,
         version="v3",
         transformers=[ProgressTransformer]  # 传递类,不是实例
     )
     
-    print("\n📊 进度追踪（通过自定义转换器）:")
     progress_count = 0
-    
     # 从 stream.extensions 访问自定义投影
     for progress in stream.extensions["progress"]:
         progress_count += 1
-        print(f"  [{progress['step']}] {progress['percent']}% - {progress['message']}")
+        print(f"  [自动] {progress['step']} - {progress['percent']}% - {progress['message']}")
+    
+    print(f"\n  自动捕获: {progress_count} 个进度事件")
+    print("  ✅ 优势: 代码简洁,可复用,类型安全")
+    
+    # ========================================================================
+    # 🎯 实际应用场景
+    # ========================================================================
+    print("\n" + "="*80)
+    print("🎯 StreamTransformer 的实际应用场景:")
+    print("="*80)
+    print("""
+1. 进度追踪:
+   • 将 custom 事件转换为进度百分比
+   • UI 显示进度条
+   
+2. Token 统计:
+   • 监听 messages 通道
+   • 统计 LLM 使用的 token 数量
+   • 计算成本
+   
+3. 工具调用监控:
+   • 监听 tools 通道
+   • 记录工具调用次数和耗时
+   • 生成调用报告
+   
+4. 错误收集:
+   • 监听所有通道
+   • 收集错误和警告
+   • 生成错误报告
+   
+5. 自定义日志:
+   • 将事件转换为结构化日志
+   • 发送到日志系统
+    """)
+    
+    # ========================================================================
+    # 💡 关键要点
+    # ========================================================================
+    print("\n💡 关键要点:")
+    print("="*60)
+    print("""
+1. StreamTransformer 是观察者模式
+   • 不修改原始事件
+   • 只创建新的投影
+   
+2. required_stream_modes 很重要
+   • 声明需要监听的通道
+   • 未声明的通道不会被发送
+   
+3. StreamChannel 是投影的容器
+   • 命名通道: StreamChannel("name") - 出现在主事件流
+   • 匿名通道: StreamChannel() - 仅作为侧通道
+   
+4. 传递类而不是实例
+   • transformers=[MyTransformer] ✅
+   • transformers=[MyTransformer()] ❌
+   • 原因: LangGraph 需要为每个流创建独立的实例
+   
+5. 访问自定义投影
+   • stream.extensions["projection_name"]
+   • 返回一个可迭代对象
+    """)
     
     print("\n✅ 最终输出:")
     final_output = stream.output
     print(f"  数据: {final_output['data']}")
     print(f"  步骤: {final_output['step']}")
     print(f"  捕获的进度事件: {progress_count} 个")
+    
+    print("\n📚 扩展阅读:")
+    print("  • 查看 EVENT_STREAMING_GUIDE.md 了解更多")
+    print("  • 官方文档: https://docs.langchain.com/oss/python/langgraph/event-streaming")
 
 
 # ============================================================================
