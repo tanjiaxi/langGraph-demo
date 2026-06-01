@@ -457,13 +457,13 @@ try:
     print("   如果未安装,请运行: pip install langgraph-checkpoint-postgres psycopg")
     
     # PostgreSQL 连接配置
-    PG_URI = "postgresql://postgres:postgres@10.10.10.10:5432/langgraph_checkpoints?sslmode=disable"
+    PG_URI = "postgresql://postgres:postgres@10.10.10.251:5432/classic_slots?sslmode=disable"
     
     print(f"\n🔌 连接到 PostgreSQL:")
     print(f"   主机: 10.10.10.10")
     print(f"   端口: 5432")
     print(f"   用户: postgres")
-    print(f"   数据库: langgraph_checkpoints")
+    print(f"   数据库: classic_slots")
     
     # 创建 PostgreSQL 连接
     print("\n⏳ 正在连接...")
@@ -564,10 +564,10 @@ try:
         print("   1. PostgreSQL 服务是否运行")
         print("   2. 主机地址和端口是否正确 (10.10.10.10:5432)")
         print("   3. 用户名和密码是否正确 (postgres/postgres)")
-        print("   4. 数据库是否存在 (langgraph_checkpoints)")
+        print("   4. 数据库是否存在 (classic_slots)")
         print("   5. 防火墙是否允许连接")
         print("\n📝 创建数据库的 SQL:")
-        print("   CREATE DATABASE langgraph_checkpoints;")
+        print("   CREATE DATABASE classic_slots;")
         
     except Exception as e:
         print(f"\n❌ 发生错误: {e}")
